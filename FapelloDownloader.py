@@ -244,7 +244,7 @@ def get_url(url: str):
         return [url]
     elif "," in url:
         models = url.split(",")
-        urls = [f"https://fapello.com/{url}/" for url in models]
+        urls = [f"https://fapello.com/{url.strip()}/" for url in models]
         return urls
     else:
        return f"https://fapello.com/{url}/"
