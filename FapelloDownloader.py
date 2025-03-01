@@ -2,44 +2,47 @@
 
 # Standard library imports
 import sys
-from time       import sleep
+import os
+import json
+import hashlib
+import time
+from time import sleep
 from webbrowser import open as open_browser
-from warnings   import filterwarnings
-
-from multiprocessing import ( 
+from warnings import filterwarnings
+from threading import Event, Lock
+from multiprocessing import (
     Process, 
-    Queue          as multiprocessing_Queue,
+    Queue as multiprocessing_Queue,
     freeze_support as multiprocessing_freeze_support
 )
-from typing    import Callable
-from shutil    import rmtree as remove_directory
+from typing import Callable, Dict
+from shutil import rmtree as remove_directory
 from itertools import repeat as itertools_repeat
 from threading import Thread
 from multiprocessing.pool import ThreadPool
 
 from os import (
-    sep         as os_separator,
-    makedirs    as os_makedirs,
-    listdir     as os_listdir
+    sep as os_separator,
+    makedirs as os_makedirs,
+    listdir as os_listdir,
+    stat as os_stat
 )
 
 from os.path import (
-    dirname  as os_path_dirname,
-    abspath  as os_path_abspath,
-    join     as os_path_join,
-    exists   as os_path_exists,
+    dirname as os_path_dirname,
+    abspath as os_path_abspath,
+    join as os_path_join,
+    exists as os_path_exists,
+    getsize as os_path_getsize
 )
 
-
 # Third-party library imports
-from re             import compile as re_compile
-from requests       import get as requests_get
-from fnmatch        import filter as fnmatch_filter
-from PIL.Image      import open as pillow_image_open
-from bs4            import BeautifulSoup
+from re import compile as re_compile
+from requests import get as requests_get
+from fnmatch import filter as fnmatch_filter
+from PIL.Image import open as pillow_image_open
+from bs4 import BeautifulSoup
 from urllib.request import Request, urlopen
-
-
 
 # GUI imports
 from tkinter import StringVar, CENTER
@@ -57,14 +60,23 @@ from customtkinter import (
 
 filterwarnings("ignore")
 
+# 新增全局变量
+stop_event = Event()
+download_lock = Lock()
+progress_file = "download_progress.json"
 app_name = "Fapello.Downloader"
-version  = "3.6"
+version = "3.7"
+
+# 可调整参数（需修改代码）
+MAX_RETRIES = 5    # 最大重试次数
+TIMEOUT = 20       # 适当增加大文件超时
+RETRY_DELAY = 3    # 降低网络环境差时的等待时间
 
 text_color      = "#F0F0F0"
 app_name_color  = "#ffbf00"
  
-githubme        = "https://github.com/Djdefrag/Fapello.Downloader"
-telegramme      = "https://linktr.ee/j3ngystudio"
+githubme        = "https://github.com/lrzjason/Fapello.Downloader"
+# telegramme      = "https://linktr.ee/j3ngystudio"
 qs_link         = "https://github.com/Djdefrag/QualityScaler"
 
 COMPLETED_STATUS   = "Completed"
@@ -78,7 +90,7 @@ HEADERS_FOR_REQUESTS = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64
 
 def opengithub() -> None: open_browser(githubme, new=1)
 
-def opentelegram() -> None: open_browser(telegramme, new=1)
+# def opentelegram() -> None: open_browser(telegramme, new=1)
 
 def openqualityscaler() -> None: open_browser(qs_link, new=1)
 
@@ -86,9 +98,50 @@ def find_by_relative_path(relative_path: str) -> str:
     base_path = getattr(sys, '_MEIPASS', os_path_dirname(os_path_abspath(__file__)))
     return os_path_join(base_path, relative_path)
 
+# ====================== 优化功能实现 ======================
+def load_progress(model_name: str) -> Dict:
+    try:
+        if os_path_exists(progress_file):
+            with open(progress_file, 'r') as f:
+                data = json.load(f)
+                return data.get(model_name, {})
+    except:
+        pass
+    return {}
+
+def save_progress(model_name: str, progress: Dict):
+    try:
+        data = {}
+        if os_path_exists(progress_file):
+            with open(progress_file, 'r') as f:
+                data = json.load(f)
+        data[model_name] = progress
+        with open(progress_file, 'w') as f:
+            json.dump(data, f, indent=2)
+    except:
+        pass
+
+def calculate_hash(file_path: str) -> str:
+    sha1 = hashlib.sha1()
+    with open(file_path, 'rb') as f:
+        while True:
+            data = f.read(65536)
+            if not data:
+                break
+            sha1.update(data)
+    return sha1.hexdigest()
+
+def validate_file(file_path: str, expected_size: int, expected_hash: str) -> bool:
+    if not os_path_exists(file_path):
+        return False
+    if os_path_getsize(file_path) != expected_size:
+        return False
+    return calculate_hash(file_path) == expected_hash
+
+# ====================== 修改核心函数 ======================
 def create_temp_dir(name_dir: str) -> None:
-    if os_path_exists(name_dir): remove_directory(name_dir)
-    if not os_path_exists(name_dir): os_makedirs(name_dir, mode=0o777)
+    if not os_path_exists(name_dir):
+        os_makedirs(name_dir, mode=0o777, exist_ok=True)
 
 def stop_thread() -> None: 
     stop = 1 + "x"
@@ -117,88 +170,110 @@ def show_error_message(exception: str) -> None:
         option_list   = [messageBox_text]
     )
 
-def read_process_status() -> None:
-    actual_step = processing_queue.get()
-
-    if actual_step == DOWNLOADING_STATUS:
-        write_process_status(processing_queue, DOWNLOADING_STATUS)
-
-    return actual_step
-
+# 修改状态读取函数
+def read_process_status() -> str:
+    try:
+        actual_step = processing_queue.get_nowait()
+        if DOWNLOADING_STATUS in actual_step:
+            _, count = actual_step.split("|")
+            return f"{DOWNLOADING_STATUS}|{count}"
+        return actual_step
+    except:
+        return DOWNLOADING_STATUS  # 队列为空时返回默认状态
 def write_process_status(
         processing_queue: multiprocessing_Queue,
         step: str
         ) -> None:
-    
-    while not processing_queue.empty(): processing_queue.get()
-    processing_queue.put(f"{step}")
+    try:
+        # 非阻塞方式清除旧消息
+        while not processing_queue.empty():
+            processing_queue.get_nowait()
+        processing_queue.put_nowait(f"{step}")
+    except:
+        pass
 
 def count_files_in_directory(target_dir: str) -> int:
     return len(fnmatch_filter(os_listdir(target_dir), '*.*'))
 
+# 修改状态检查线程
 def thread_check_steps_download(
         link: str, 
         how_many_files: int
         ) -> None:
     
-    sleep(1)
-    target_dir = link.split("/")[3]
-
+    def safe_update(message: str):
+        if not stop_event.is_set():
+            info_message.set(message)
+            window.update_idletasks()
+    
     try:
-        while True:
+        while not stop_event.is_set():
             actual_step = read_process_status()
-
-            if actual_step == COMPLETED_STATUS:
-                info_message.set(f"Download completed! :)")
-                stop_thread()
-
-            elif actual_step == DOWNLOADING_STATUS:
-                file_count = count_files_in_directory(target_dir)
-                info_message.set(f"Downloading {str(file_count)} / {str(how_many_files)}")
+            
+            if DOWNLOADING_STATUS in actual_step:
+                _, current, total = actual_step.split("|")
+                failed = count_failed_files(link.split("/")[3])
+                safe_update(f"Downloading {current}/{total} | Failed: {failed}")
+                
+            elif actual_step == COMPLETED_STATUS:
+                safe_update("Download completed! :)")
+                break
                 
             elif actual_step == STOP_STATUS:
-                info_message.set(f"Download stopped")
-                stop_thread()
-
-            elif ERROR_STATUS in actual_step:
-                error_message = f"Error while downloading :("
-                info_message.set(error_message)
-
-                error = actual_step.replace(ERROR_STATUS, "")
-                show_error_message(error)
-                stop_thread()
-
-            else:
-                info_message.set(actual_step)
+                safe_update("Download stopped")
+                break
                 
-            sleep(1)    
-    except:
-        place_download_button()
-
+            elif ERROR_STATUS in actual_step:
+                error = actual_step.replace(ERROR_STATUS, "")
+                safe_update("Error while downloading :(")
+                window.after(0, lambda: show_error_message(error))
+                break
+                
+            sleep(0.3)  # 更快的刷新频率
+            
+    except Exception as e:
+        print(f"Monitor error: {str(e)}")
+    finally:
+        window.after(0, place_download_button)
 
 
 # Core
 
+def get_url(url: str):
+    if url.startswith("http"):
+        return [url]
+    elif "," in url:
+        models = url.split(",")
+        urls = [f"https://fapello.com/{url}/" for url in models]
+        return urls
+    else:
+       return f"https://fapello.com/{url}/"
+
 def check_button_command() -> None:
 
-    selected_link = str(selected_url.get()).strip()
+    links = get_url(selected_url.get())
+    # check links is list or not
+    if not isinstance(links, list): links = [links]
+    total = 0
+    for link in links:
+        selected_link = str(link).strip()
 
-    if selected_link == "Paste link here https://fapello.com/emily-rat---/": info_message.set("Insert a valid Fapello.com link")
+        if selected_link == "Paste link here https://fapello.com/emily-rat---/": info_message.set("Insert a valid Fapello.com link")
 
-    elif selected_link == "": info_message.set("Insert a valid Fapello.com link")
+        elif selected_link == "": info_message.set("Insert a valid Fapello.com link")
 
-    elif "https://fapello.com" in selected_link:
+        elif "https://fapello.com" in selected_link:
 
-        if not selected_link.endswith("/"): selected_link = selected_link + '/'
+            if not selected_link.endswith("/"): selected_link = selected_link + '/'
 
-        how_many_files = get_Fapello_files_number(selected_link)
+            total += get_Fapello_files_number(selected_link)
 
-        if how_many_files == 0:
-            info_message.set("No files found for this link")
-        else: 
-            info_message.set(f"Found {how_many_files} files for this link")
+        else: info_message.set("Insert a valid Fapello.com link")
 
-    else: info_message.set("Insert a valid Fapello.com link")
+    if total == 0:
+        info_message.set("No files found for this link")
+    else: 
+        info_message.set(f"Found {total} files for this link")
 
 def download_button_command() -> None:
     global process_download
@@ -213,61 +288,60 @@ def download_button_command() -> None:
         info_message.set("Cpu number must be a numeric value")
         return
 
-    selected_link = str(selected_url.get()).strip()
+    links = get_url(selected_url.get())
+    # check links is list or not
+    if not isinstance(links, list): links = [links]
+    for link in links:
+        selected_link = str(link).strip()
 
-    if selected_link == "Paste link here https://fapello.com/emily-rat---/":
-        info_message.set("Insert a valid Fapello.com link")
+        if selected_link == "Paste link here https://fapello.com/emily-rat---/":
+            info_message.set("Insert a valid Fapello.com link")
 
-    elif selected_link == "":
-        info_message.set("Insert a valid Fapello.com link")
+        elif selected_link == "":
+            info_message.set("Insert a valid Fapello.com link")
 
-    elif "https://fapello.com" in selected_link:
+        elif "https://fapello.com" in selected_link:
 
-        download_type = 'fapello.com'
+            download_type = 'fapello.com'
 
-        if not selected_link.endswith("/"): selected_link = selected_link + '/'
+            if not selected_link.endswith("/"): selected_link = selected_link + '/'
 
-        how_many_images = get_Fapello_files_number(selected_link)
+            how_many_images = get_Fapello_files_number(selected_link)
 
-        if how_many_images == 0:
-            info_message.set("No files found for this link")
-        else: 
-            process_download = Process(
-                target = download_orchestrator,
-                args = (
-                    processing_queue,
-                    selected_link, 
-                    cpu_number
+            if how_many_images == 0:
+                info_message.set("No files found for this link")
+            else: 
+                process_download = Process(
+                    target = download_orchestrator,
+                    args = (
+                        processing_queue,
+                        selected_link, 
+                        cpu_number
+                        )
                     )
-                )
-            process_download.start()
+                process_download.start()
 
-            thread_wait = Thread(
-                target = thread_check_steps_download,
-                args = (
-                    selected_link, 
-                    how_many_images
+                thread_wait = Thread(
+                    target = thread_check_steps_download,
+                    args = (
+                        selected_link, 
+                        how_many_images
+                        )
                     )
-                )
-            thread_wait.start()
+                thread_wait.start()
 
-            place_stop_button()
+                place_stop_button()
 
-    else:
-        info_message.set("Insert a valid Fapello.com link")
+        else:
+            info_message.set("Insert a valid Fapello.com link")
 
+# ====================== 改进停止机制 ======================
 def stop_download_process() -> None:
-    global process_download
-    try:
-        process_download
-    except:
-        pass
-    else:
-        process_download.kill()
+    stop_event.set()
 
 def stop_button_command() -> None:
     stop_download_process()
-    write_process_status(processing_queue, f"{STOP_STATUS}") 
+    write_process_status(processing_queue, f"{STOP_STATUS}")
 
 def get_Fapello_file_url(link: str) -> tuple:
     
@@ -304,63 +378,143 @@ def get_Fapello_files_number(url: str) -> int:
             return int(link_href_numeric) + 1
 
     return 0
-
+# 修改线程下载函数
 def thread_download_file(
-        link: str, 
-        target_dir: str, 
-        index: int
-        ) -> None:
-    
-    link       = link + str(index)       
+        link: str,
+        target_dir: str,
+        index: int,
+        stop_flag: Event
+) -> None:
+    if stop_flag.is_set():
+        return
+
     model_name = link.split('/')[3]
+    file_url, file_type = get_Fapello_file_url(link + str(index))
+    
+    if not file_url or model_name not in file_url:
+        return
 
-    file_url, file_type = get_Fapello_file_url(link)
+    filename = prepare_filename(file_url, index, file_type)
+    file_path = os_path_join(target_dir, filename)
+    
+    progress = load_progress(model_name)
+    # 检查文件有效性时包含重试记录
+    if filename in progress:
+        if progress[filename].get('status') == 'completed':
+            if validate_file(file_path, progress[filename]['size'], progress[filename]['hash']):
+                return
+        elif progress[filename].get('retries', 0) >= MAX_RETRIES:
+            return
 
-    if file_url != None and model_name in file_url:
-        try:        
-            file_name = prepare_filename(file_url, index, file_type)
-            file_path = os_path_join(target_dir, file_name)
-
-            request  = Request(file_url, headers = HEADERS_FOR_REQUESTS)
-            response = urlopen(request)
-
-            with open(file_path, 'wb') as output_file: output_file.write(response.read())
-
-        except:
-            pass
+    retry_count = 0
+    while retry_count < MAX_RETRIES and not stop_flag.is_set():
+        try:
+            request = Request(file_url, headers=HEADERS_FOR_REQUESTS)
+            with urlopen(request, timeout=TIMEOUT) as response:
+                content = response.read()
+                # 检查停止信号
+                if stop_flag.is_set():
+                    return
                 
+                # 验证内容完整性
+                if len(content) < 1024:  # 最小文件尺寸保护
+                    raise ValueError("Incomplete content")
+                
+                file_size = len(content)
+                file_hash = hashlib.sha1(content).hexdigest()
+                
+                with open(file_path, 'wb') as output_file:
+                    output_file.write(content)
+                
+                # 更新成功状态
+                with download_lock:
+                    progress[filename] = {
+                        'status': 'completed',
+                        'size': file_size,
+                        'hash': file_hash,
+                        'timestamp': time.time()
+                    }
+                    save_progress(model_name, progress)
+                break
+                    
+        except Exception as e:
+            print(f"Download error ({retry_count+1}/{MAX_RETRIES}): {e}")
+            # 更新重试记录
+            with download_lock:
+                progress.setdefault(filename, {}).update({
+                    'status': 'retrying',
+                    'retries': retry_count + 1,
+                    'last_error': str(e),
+                    'timestamp': time.time()
+                })
+                save_progress(model_name, progress)
+            
+            retry_count += 1
+            if retry_count < MAX_RETRIES:
+                sleep(RETRY_DELAY * retry_count)  # 指数退避
+            else:
+                print(f"Skip file after {MAX_RETRIES} retries: {filename}")
+                # 标记最终失败状态
+                with download_lock:
+                    progress[filename] = {
+                        'status': 'failed',
+                        'retries': MAX_RETRIES,
+                        'errors': [str(e) for _ in range(retry_count)],
+                        'timestamp': time.time()
+                    }
+                    save_progress(model_name, progress)
+                return
+                # 修改下载协调器增加实时进度更新
 def download_orchestrator(
         processing_queue: multiprocessing_Queue,
-        selected_link: str, 
+        selected_link: str,
         cpu_number: int
-        ):
-    
-    target_dir    = selected_link.split("/")[3]
-    list_of_index = []
-
-    write_process_status(processing_queue, DOWNLOADING_STATUS)
+):
+    stop_event.clear()
+    model_dir = selected_link.split("/")[3]
+    target_dir = f"output/{model_dir}"
+    create_temp_dir(target_dir)
     
     try:
-        create_temp_dir(target_dir)
         how_many_files = get_Fapello_files_number(selected_link)
-        list_of_index  = [index for index in range(how_many_files)]
+        total_files = how_many_files
+        completed_files = 0
+        
+        # 实时进度更新线程
+        def progress_monitor():
+            nonlocal completed_files
+            while not stop_event.is_set():
+                current_count = count_files_in_directory(target_dir)
+                if current_count > completed_files:
+                    completed_files = current_count
+                    write_process_status(
+                        processing_queue, 
+                        f"{DOWNLOADING_STATUS}|{completed_files}|{total_files}"
+                    )
+                sleep(0.5)  # 每500ms更新一次
+        
+        monitor_thread = Thread(target=progress_monitor)
+        monitor_thread.start()
         
         with ThreadPool(cpu_number) as pool:
             pool.starmap(
                 thread_download_file,
                 zip(
-                    itertools_repeat(selected_link), 
-                    itertools_repeat(target_dir), 
-                    list_of_index
-                ) 
+                    itertools_repeat(selected_link),
+                    itertools_repeat(target_dir),
+                    range(how_many_files),
+                    itertools_repeat(stop_event)
+                )
             )
+        
+        stop_event.set()
+        monitor_thread.join()
+        
+        if not stop_event.is_set():
+            write_process_status(processing_queue, COMPLETED_STATUS)
             
-        write_process_status(processing_queue, COMPLETED_STATUS)
-
     except Exception as error:
-        print(error) 
-        pass
-
+        write_process_status(processing_queue, f"{ERROR_STATUS}{str(error)}")
 
 
 #  UI function 
@@ -381,20 +535,20 @@ def place_github_button():
     
     git_button.place(relx = 0.055, rely = 0.875, anchor = CENTER)
 
-def place_telegram_button():
-    telegram_button = CTkButton(master     = window, 
-                                image      = logo_telegram,
-                                command    = opentelegram,
-                                width         = 30,
-                                height        = 30,
-                                border_width  = 1,
-                                fg_color      = "transparent",
-                                text_color    = "#C0C0C0",
-                                border_color  = "#404040",
-                                anchor        = "center",                           
-                                text          = "", 
-                                font          = bold11)
-    telegram_button.place(relx = 0.055, rely = 0.95, anchor = CENTER)
+# def place_telegram_button():
+#     telegram_button = CTkButton(master     = window, 
+#                                 image      = logo_telegram,
+#                                 command    = opentelegram,
+#                                 width         = 30,
+#                                 height        = 30,
+#                                 border_width  = 1,
+#                                 fg_color      = "transparent",
+#                                 text_color    = "#C0C0C0",
+#                                 border_color  = "#404040",
+#                                 anchor        = "center",                           
+#                                 text          = "", 
+#                                 font          = bold11)
+#     telegram_button.place(relx = 0.055, rely = 0.95, anchor = CENTER)
  
 def place_qualityscaler_button():
     qualityscaler_button = CTkButton(
@@ -738,7 +892,34 @@ def create_text_box(textvariable, width, heigth):
         fg_color      = "#000000",
         border_color  = "#404040"
     )
-    
+
+def count_failed_files(target_dir: str) -> int:
+    try:
+        model_name = target_dir.split('/')[-1]
+        progress = load_progress(model_name)
+        return sum(1 for f in progress.values() if f.get('status') == 'failed')
+    except:
+        return 0
+
+# 修复后的place_advanced_settings函数
+def place_advanced_settings():
+    settings_button = create_info_button(
+        command=lambda: CTkMessageBox(
+            messageType='info',
+            title="Advanced Settings",
+            subtitle=f"Current configuration:\nRetries: {MAX_RETRIES}\nTimeout: {TIMEOUT}s",
+            default_value=None,  # 新增必填参数
+            option_list=[
+                "These settings can be modified in code:",
+                f"MAX_RETRIES = {MAX_RETRIES}",
+                f"TIMEOUT = {TIMEOUT}",
+                f"RETRY_DELAY = {RETRY_DELAY}"
+            ]
+        ), 
+        text="Advanced Settings",
+        width=140
+    )
+    settings_button.place(relx=0.42, rely=0.5, anchor=CENTER)
 
 
 class App:
@@ -756,32 +937,38 @@ class App:
         place_app_name()
         place_qualityscaler_button()
         place_github_button()
-        place_telegram_button()
+        # place_telegram_button()
         place_link_textbox()
         place_check_button()
         place_simultaneous_downloads_textbox()
         place_tips()
         place_message_label()             
         place_download_button()
+        place_advanced_settings()
 
-if __name__ == "__main__":    
+if __name__ == "__main__":
     multiprocessing_freeze_support()
-
+    
+    # 使用Manager确保跨进程通信
+    from multiprocessing import Manager
+    manager = Manager()
+    processing_queue = manager.Queue(maxsize=10)
+    
     set_appearance_mode("Dark")
     set_default_color_theme("dark-blue")
 
-    processing_queue = multiprocessing_Queue(maxsize=1)
-
-    window = CTk() 
-
+    window = CTk()
     selected_url        = StringVar()
     info_message        = StringVar()
     selected_cpu_number = StringVar()
 
-    selected_url.set("Paste link here https://fapello.com/emily-rat---/")
+    selected_url.set("Paste model name here or link https://fapello.com/emily-rat---/")
     selected_cpu_number.set("6")
-    info_message.set("Hi :)")
-
+    info_message.set("Hi :) - Optimized v3.7")
+    
+    # 新增初始化停止事件
+    stop_event = Event()
+    
     font   = "Segoe UI"    
     bold8  = CTkFont(family = font, size = 8, weight = "bold")
     bold9  = CTkFont(family = font, size = 9, weight = "bold")

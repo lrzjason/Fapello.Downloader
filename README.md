@@ -1,3 +1,16 @@
+## Thanks for Djdefrag open source this downloader
+Based on the original repo, I've added a few functionality to make it more useful for me.
+- Moved all downloads to output folder
+- Added gitignore
+- allow to download by model name, e.g. mia-kha***
+- support multiple models at once, e.g. model-a***, model-b***, model-c***
+- support auto retry
+- support files verify, download the same model without duplicated download
+- added run.bat for windows
+
+
+## The following is the original repo Readme
+
 <div align="center">
     <br>
     <img src="https://user-images.githubusercontent.com/32263112/205343453-e2f61261-3fb4-4d9b-8fe7-2be67fc0fcfb.png" width="175"> </a> 
